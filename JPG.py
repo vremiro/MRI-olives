@@ -3,7 +3,7 @@
 Automated MRI Feature Extraction and Machine Learning Pipeline for Olive Oil Content Estimation (JPG Format).
 
 This script extracts morphological (flesh area, pit area, flesh-to-pit ratio) and pixel-level 
-intensity statistics from JPG MRI slices, and trains Random Forest (RF) and Partial Least Squares (PLS) 
+intensity statistics from 8-bit JPG MRI slices, and trains Random Forest (RF) and Partial Least Squares (PLS) 
 regression models using nested cross-validation grouped by physical tree.
 """
 
