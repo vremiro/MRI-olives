@@ -1,107 +1,164 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Oct 14 12:00:24 2026
+Automated MRI Feature Extraction and Machine Learning Pipeline for Olive Oil Content Estimation (TIFF 32-bit Format).
 
-@author: victo
+This script extracts morphological (flesh area, pit area, flesh-to-pit ratio) and pixel-level 
+intensity statistics from 32-bit TIFF MRI slices, and trains Random Forest (RF) and Partial Least Squares (PLS) 
+regression models using nested cross-validation grouped by physical tree.
 """
 
+from itertools import product
 import os
-import re
-import numpy as np
-import pandas as pd
-import imageio.v3 as iio
 from glob import glob
 from PIL import Image
-from sklearn.ensemble import RandomForestRegressor
+
+import imageio.v3 as iio
+import numpy as np
+import pandas as pd
 from sklearn.cross_decomposition import PLSRegression
-from sklearn.model_selection import GroupKFold, LeaveOneGroupOut
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GroupKFold
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
+# ============================
+# CONFIGURATION
+# ============================
 
-IMAGES_DIR = r"C:\Users\victo\OneDrive - Universidad Complutense de Madrid (UCM)\DOCTORADO\ARTÍCULOS PUBLICADOS POR MI\ARTÍCULO OLIVAS MRI BRAGANÇA\DATASETS USADOS\MODELOS MACHINE LEARNING\TIFF\DATASET CÁLCULOS TIFF\TIFF CÁLCULOS 32bits"
-MASKS_FLESH_DIR = r"C:\Users\victo\OneDrive - Universidad Complutense de Madrid (UCM)\DOCTORADO\ARTÍCULOS PUBLICADOS POR MI\ARTÍCULO OLIVAS MRI BRAGANÇA\DATASETS USADOS\MODELOS MACHINE LEARNING\TIFF\MÁSCARAS TIFF\masks_output (1)\flesh"
-MASKS_PIT_DIR   = r"C:\Users\victo\OneDrive - Universidad Complutense de Madrid (UCM)\DOCTORADO\ARTÍCULOS PUBLICADOS POR MI\ARTÍCULO OLIVAS MRI BRAGANÇA\DATASETS USADOS\MODELOS MACHINE LEARNING\TIFF\MÁSCARAS TIFF\masks_output (1)\pit"
+IMAGES_DIR = r"MRI_IMAGES"
+MASKS_FLESH_DIR = r"FLESH_MASKS"
+MASKS_PIT_DIR = r"PIT_MASKS"
+OIL_FILE = r"SOXHLET_OIL_CONTENT"
 
-OUTPUT_OLIVES   = "resultados_tiff32_por_oliva.csv"
-OUTPUT_TREES    = "resultados_tiff32_por_arbol.csv"
-OUTPUT_PIXELS   = "intensidades_pixeles_pulpa_tiff.csv"
+OUTPUT_OLIVES = "resultados_tiff32_por_oliva.csv"
+OUTPUT_TREES = "resultados_tiff32_por_arbol.csv"
+OUTPUT_PIXELS = "intensidades_pixeles_pulpa_tiff.csv"
 OUTPUT_FEATURES = "features_por_arbol_tiff.csv"
-
-GRASA_FILE      = r"C:\Users\victo\OneDrive - Universidad Complutense de Madrid (UCM)\DOCTORADO\ARTÍCULOS PUBLICADOS POR MI\ARTÍCULO OLIVAS MRI BRAGANÇA\DATASETS USADOS\MODELOS MACHINE LEARNING\grasa_arbol.xlsx"
+EXCEL_OUTPUT = "resultados_modelo_randomforest_tiff_final_permutacion.xlsx"
 
 N_ESTIMATORS = 500
 RANDOM_STATE = 42
-MAX_PLS_COMP = 6   # nº máximo de componentes PLS a explorar (se elige por CV interna)
+N_REPEATS_PERM = 50
+MAX_PLS_COMP = 6
 FEATS = ["mean", "std", "median", "p05", "p25", "p75", "p95", "n_pixeles"]
 
+# Agrupación lógica de variables para Grouped Permutation Importance
+FEATURE_GROUPS = {
+    "Tendencia_Central": ["mean", "median"],
+    "Extremos_Superiores": ["p75", "p95"],
+    "Extremos_Inferiores": ["p05", "p25"],
+    "Dispersión": ["std"],
+    "Tamaño": ["n_pixeles"]
+}
 
-# ============================================================
-# FUNCIONES
-# ============================================================
+# Hyperparameter grid for Random Forest nested cross-validation
+RF_GRID = {
+    "min_samples_leaf": [1, 3, 5],
+    "max_features": [1.0, 0.5, 0.33],
+    "max_depth": [None, 5],
+}
+RF_DEFAULTS = {"min_samples_leaf": 1, "max_features": 1.0, "max_depth": None}
+
+
+# ============================
+# HELPER FUNCTIONS
+# ============================
 
 def load_tiff32(path):
+    """Load 32-bit TIFF image file and return float32 numpy array."""
     img = iio.imread(path)
     return img.astype(np.float32)
 
+
 def load_and_resize_mask(mask_path, target_shape):
+    """Load binary mask image, resize to target shape, and return boolean array."""
     mask = Image.open(mask_path).convert("L")
     mask = mask.resize((target_shape[1], target_shape[0]), Image.NEAREST)
     return np.array(mask) > 0
 
+
 def extract_tree_name(name):
+    """Extract standard tree identifier from slice file name."""
     parts = name.split("_")
     if "arbol" not in parts:
         return "desconocido"
-
     idx = parts.index("arbol")
-    arbol_num = parts[idx + 1]
+    num = parts[idx + 1]
     mes = parts[idx + 2]
-
     if parts[idx + 3].isdigit() and len(parts[idx + 3]) == 1:
         sufijo = "_" + parts[idx + 3]
         año = parts[idx + 4]
     else:
         sufijo = ""
         año = parts[idx + 3]
+    return f"arbol_{num}_{mes}{sufijo}_{año}"
 
-    return f"arbol_{arbol_num}_{mes}{sufijo}_{año}"
 
 def add_groups(df):
-    """
-    A partir del identificador 'arbol' (arbol_{num}_{mes}[_sufijo]_{año})
-    crea:
-      - arbol_id: número de árbol físico (grupo para GroupKFold)
-      - cosecha:  año (grupo para Leave-One-Harvest-Out)
-    """
+    """Extract tree ID and harvest season for grouped cross-validation splits."""
     parts = df["arbol"].str.split("_")
-    df = df.copy()
     df["arbol_id"] = parts.str[1]
     df["cosecha"] = parts.str[-1]
     return df
 
+
 def cv_metrics(y, pred):
+    """Calculate standard regression metrics (R2, MAE, RMSE)."""
     return {
         "R2": r2_score(y, pred),
         "MAE": mean_absolute_error(y, pred),
         "RMSE": np.sqrt(mean_squared_error(y, pred)),
     }
 
+
+# ============================
+# MACHINE LEARNING FIT & PREDICT
+# ============================
+
 def rf_fit_predict(Xtr, ytr, gtr, Xte):
-    m = RandomForestRegressor(n_estimators=N_ESTIMATORS,
-                              max_depth=None,
-                              random_state=RANDOM_STATE)
+    """Fit Random Forest regressor with nested GroupKFold hyperparameter tuning."""
+    n_groups = pd.Series(np.asarray(gtr)).nunique()
+    combos = [dict(zip(RF_GRID.keys(), v)) for v in product(*RF_GRID.values())]
+    best = RF_DEFAULTS
+
+    if n_groups >= 3:
+        inner = GroupKFold(n_splits=min(5, n_groups))
+        rmses = {}
+
+        for i, params in enumerate(combos):
+            errs = []
+            for itr, ite in inner.split(Xtr, ytr, gtr):
+                m = RandomForestRegressor(
+                    n_estimators=N_ESTIMATORS,
+                    random_state=RANDOM_STATE,
+                    n_jobs=-1,
+                    **params
+                )
+                m.fit(Xtr.iloc[itr], ytr.iloc[itr])
+                errs.append(ytr.iloc[ite].values - m.predict(Xtr.iloc[ite]))
+
+            rmses[i] = np.sqrt(np.mean(np.concatenate(errs)**2))
+
+        best = combos[min(rmses, key=rmses.get)]
+
+    m = RandomForestRegressor(
+        n_estimators=N_ESTIMATORS,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        **best
+    )
     m.fit(Xtr, ytr)
-    return m.predict(Xte), ""
+
+    info = (
+        f"min_samples_leaf={best['min_samples_leaf']}; "
+        f"max_features={best['max_features']}; "
+        f"max_depth={best['max_depth']}"
+    )
+
+    return m.predict(Xte), info
+
 
 def pls_fit_predict(Xtr, ytr, gtr, Xte):
-    """
-    PLS-R lineal (variables autoescaladas). El nº de componentes se elige
-    DENTRO del conjunto de entrenamiento con una CV interna agrupada por
-    árbol físico (gtr), para que el conjunto de test no influya en la elección.
-    """
+    """Fit Partial Least Squares regressor with nested GroupKFold component tuning."""
     max_c = min(MAX_PLS_COMP, Xtr.shape[1], len(Xtr) - 1)
     best_c = 1
     n_groups = pd.Series(np.asarray(gtr)).nunique()
@@ -109,40 +166,32 @@ def pls_fit_predict(Xtr, ytr, gtr, Xte):
     if max_c > 1 and n_groups >= 3:
         inner = GroupKFold(n_splits=min(5, n_groups))
         rmses = {}
+
         for c in range(1, max_c + 1):
             errs = []
             for itr, ite in inner.split(Xtr, ytr, gtr):
                 m = PLSRegression(n_components=c, scale=True)
                 m.fit(Xtr.iloc[itr], ytr.iloc[itr])
                 errs.append(ytr.iloc[ite].values - m.predict(Xtr.iloc[ite]).ravel())
-            rmses[c] = np.sqrt(np.mean(np.concatenate(errs) ** 2))
+
+            rmses[c] = np.sqrt(np.mean(np.concatenate(errs)**2))
+
         best_c = min(rmses, key=rmses.get)
 
     m = PLSRegression(n_components=best_c, scale=True)
     m.fit(Xtr, ytr)
     return m.predict(Xte).ravel(), f"n_comp={best_c}"
 
-def resumen_pls(nombre, cv_tree, cv_loho, n_feats):
-    filas = [("Modelo", nombre)]
-    filas += [(f"{k}_CV_arbol_OOF", v) for k, v in cv_tree.items()]
-    filas += [(f"{k}_LOHO_OOF", v) for k, v in cv_loho.items()]
-    filas += [("n_features", n_feats),
-              ("max_componentes_explorados", min(MAX_PLS_COMP, n_feats)),
-              ("seleccion_componentes", "CV interna agrupada por árbol (RMSE mínimo)"),
-              ("escalado", "autoescalado (scale=True)")]
-    return pd.DataFrame(filas, columns=["Parametro", "Valor"])
 
-def run_cv(df, feats, splitter, groups, label="", fit_predict=rf_fit_predict, inner_groups=None):
-    """
-    Validación cruzada agrupada.
-    Devuelve: métricas sobre predicciones out-of-fold agrupadas,
-              DataFrame con métricas por fold, y predicciones out-of-fold.
-    inner_groups: grupos (árbol físico) para la CV interna de selección de
-                  hiperparámetros (solo usada por PLS).
-    """
+# ============================
+# CROSS-VALIDATION & PERMUTATION IMPORTANCE
+# ============================
+
+def run_cv(df, feats, splitter, groups, label="", fit_predict=rf_fit_predict):
+    """Run cross-validation loop and gather out-of-fold predictions and fold metrics."""
     X, y = df[feats], df["grasa"]
-    if inner_groups is None:
-        inner_groups = df["arbol_id"]
+    inner_groups = df["arbol_id"]
+
     oof = np.full(len(df), np.nan)
     folds = []
 
@@ -150,38 +199,185 @@ def run_cv(df, feats, splitter, groups, label="", fit_predict=rf_fit_predict, in
         pred, info = fit_predict(X.iloc[tr], y.iloc[tr], inner_groups.iloc[tr], X.iloc[te])
         oof[te] = pred
 
-        met = cv_metrics(y.iloc[te], oof[te])
+        met = cv_metrics(y.iloc[te], pred)
         met["info"] = info
         met["fold"] = k + 1
+        met["n_train_samples"] = len(tr)
+        met["n_test_samples"] = len(te)
+        met["n_train_groups"] = inner_groups.iloc[tr].nunique()
+        met["n_test_groups"] = inner_groups.iloc[te].nunique()
         met["grupos_test"] = ",".join(sorted(set(groups.iloc[te].astype(str))))
-        met["n_train"] = len(tr)
-        met["n_test"] = len(te)
         folds.append(met)
-        print(f"[{label}] fold {k+1} | test: {met['grupos_test'][:60]} | "
-              f"R2: {met['R2']:.3f} | MAE: {met['MAE']:.3f} | RMSE: {met['RMSE']:.3f}")
+
+        print(
+            f"[{label}] fold {k+1} | Train: {len(tr)} obs, {met['n_train_groups']} grp | "
+            f"Test: {len(te)} obs, {met['n_test_groups']} grp ({met['grupos_test']}) | "
+            f"R2={met['R2']:.3f} | MAE={met['MAE']:.3f} | RMSE={met['RMSE']:.3f} | {info}"
+        )
 
     overall = cv_metrics(y, oof)
-    print(f"[{label}] OOF agrupado -> R2: {overall['R2']:.3f} | "
-          f"MAE: {overall['MAE']:.3f} | RMSE: {overall['RMSE']:.3f}\n")
+    print(
+        f"[{label}] OOF -> R2={overall['R2']:.3f} MAE={overall['MAE']:.3f} RMSE={overall['RMSE']:.3f}\n"
+    )
+
     return overall, pd.DataFrame(folds), oof
 
-def resumen(nombre, cv_tree, cv_loho, n_feats):
-    filas = [("Modelo", nombre)]
-    filas += [(f"{k}_CV_arbol_OOF", v) for k, v in cv_tree.items()]
-    filas += [(f"{k}_LOHO_OOF", v) for k, v in cv_loho.items()]
-    filas += [("n_features", n_feats),
-              ("n_estimators", N_ESTIMATORS),
-              ("max_depth", "None"),
-              ("random_state", RANDOM_STATE)]
+
+def compute_rf_cv_permutation_importance(X, y, groups, inner_groups_full, splitter):
+    """Compute out-of-fold grouped permutation feature importance across external CV folds for Random Forest."""
+    fold_means = []
+    group_names = list(FEATURE_GROUPS.keys())
+
+    for tr, te in splitter.split(X, y, groups):
+        Xtr, ytr, gtr = X.iloc[tr], y.iloc[tr], inner_groups_full.iloc[tr]
+        Xte, yte = X.iloc[te], y.iloc[te]
+
+        n_groups = pd.Series(np.asarray(gtr)).nunique()
+        combos = [dict(zip(RF_GRID.keys(), v)) for v in product(*RF_GRID.values())]
+        best = RF_DEFAULTS
+
+        if n_groups >= 3:
+            inner = GroupKFold(n_splits=min(5, n_groups))
+            rmses = {}
+            for i, params in enumerate(combos):
+                errs = []
+                for itr, ite in inner.split(Xtr, ytr, gtr):
+                    m_inner = RandomForestRegressor(
+                        n_estimators=N_ESTIMATORS,
+                        random_state=RANDOM_STATE,
+                        n_jobs=-1,
+                        **params
+                    )
+                    m_inner.fit(Xtr.iloc[itr], ytr.iloc[itr])
+                    errs.append(ytr.iloc[ite].values - m_inner.predict(Xtr.iloc[ite]))
+                rmses[i] = np.sqrt(np.mean(np.concatenate(errs)**2))
+            best = combos[min(rmses, key=rmses.get)]
+
+        m = RandomForestRegressor(
+            n_estimators=N_ESTIMATORS,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            **best
+        )
+        m.fit(Xtr, ytr)
+
+        # Grouped Permutation Importance
+        baseline_score = np.sqrt(mean_squared_error(yte, m.predict(Xte)))
+        rng = np.random.default_rng(RANDOM_STATE)
+        
+        group_imp_fold = []
+        for g_name in group_names:
+            cols = FEATURE_GROUPS[g_name]
+            valid_cols = [c for c in cols if c in X.columns]
+            
+            if not valid_cols:
+                group_imp_fold.append(0.0)
+                continue
+                
+            drops = []
+            for _ in range(N_REPEATS_PERM):
+                X_perm = Xte.copy()
+                perm_idx = rng.permutation(len(X_perm))
+                X_perm[valid_cols] = X_perm[valid_cols].values[perm_idx, :]
+                score = np.sqrt(mean_squared_error(yte, m.predict(X_perm)))
+                drops.append(score - baseline_score)
+            group_imp_fold.append(np.mean(drops))
+            
+        fold_means.append(group_imp_fold)
+
+    fold_means_matrix = np.array(fold_means)
+
+    return pd.DataFrame({
+        "feature": group_names,
+        "importance_mean": np.mean(fold_means_matrix, axis=0),
+        "importance_std": np.std(fold_means_matrix, axis=0)
+    }).sort_values("importance_mean", ascending=False)
+
+
+def compute_pls_cv_permutation_importance(X, y, groups, inner_groups_full, splitter):
+    """Compute out-of-fold grouped permutation feature importance across external CV folds for PLS."""
+    fold_means = []
+    group_names = list(FEATURE_GROUPS.keys())
+
+    for tr, te in splitter.split(X, y, groups):
+        Xtr, ytr, gtr = X.iloc[tr], y.iloc[tr], inner_groups_full.iloc[tr]
+        Xte, yte = X.iloc[te], y.iloc[te]
+
+        max_c = min(MAX_PLS_COMP, Xtr.shape[1], len(Xtr) - 1)
+        best_c = 1
+        n_inner_groups = pd.Series(np.asarray(gtr)).nunique()
+
+        if max_c > 1 and n_inner_groups >= 3:
+            inner = GroupKFold(n_splits=min(5, n_inner_groups))
+            rmses = {}
+            for c in range(1, max_c + 1):
+                errs = []
+                for itr, ite in inner.split(Xtr, ytr, gtr):
+                    m_inner = PLSRegression(n_components=c, scale=True)
+                    m_inner.fit(Xtr.iloc[itr], ytr.iloc[itr])
+                    errs.append(ytr.iloc[ite].values - m_inner.predict(Xtr.iloc[ite]).ravel())
+                rmses[c] = np.sqrt(np.mean(np.concatenate(errs)**2))
+            best_c = min(rmses, key=rmses.get)
+
+        m = PLSRegression(n_components=best_c, scale=True)
+        m.fit(Xtr, ytr)
+
+        # Grouped Permutation Importance
+        baseline_score = np.sqrt(mean_squared_error(yte, m.predict(Xte).ravel()))
+        rng = np.random.default_rng(RANDOM_STATE)
+        
+        group_imp_fold = []
+        for g_name in group_names:
+            cols = FEATURE_GROUPS[g_name]
+            valid_cols = [c for c in cols if c in X.columns]
+            
+            if not valid_cols:
+                group_imp_fold.append(0.0)
+                continue
+                
+            drops = []
+            for _ in range(N_REPEATS_PERM):
+                X_perm = Xte.copy()
+                perm_idx = rng.permutation(len(X_perm))
+                X_perm[valid_cols] = X_perm[valid_cols].values[perm_idx, :]
+                score = np.sqrt(mean_squared_error(yte, m.predict(X_perm).ravel()))
+                drops.append(score - baseline_score)
+            group_imp_fold.append(np.mean(drops))
+            
+        fold_means.append(group_imp_fold)
+
+    fold_means_matrix = np.array(fold_means)
+
+    return pd.DataFrame({
+        "feature": group_names,
+        "importance_mean": np.mean(fold_means_matrix, axis=0),
+        "importance_std": np.std(fold_means_matrix, axis=0)
+    }).sort_values("importance_mean", ascending=False)
+
+
+def resumen(nombre, cv_tree, n_feats):
+    """Format model summary parameters into a structured DataFrame."""
+    filas = [
+        ("Modelo", nombre),
+        ("R2_CV_arbol_OOF", cv_tree["R2"]),
+        ("MAE_CV_arbol_OOF", cv_tree["MAE"]),
+        ("RMSE_CV_arbol_OOF", cv_tree["RMSE"]),
+        ("n_features", n_feats),
+        ("rejilla_hiperparametros", str(RF_GRID)),
+        ("seleccion_hiperparametros", "CV interna agrupada por árbol (RMSE mínimo)"),
+        ("random_state", RANDOM_STATE)
+    ]
     return pd.DataFrame(filas, columns=["Parametro", "Valor"])
 
 
-# ============================================================
-# 1) PROCESAMIENTO POR OLIVA + EXTRACCIÓN DE PIXELES
-# ============================================================
+# ============================
+# 1) SLICE-LEVEL FEATURE EXTRACTION & MORPHOLOGY
+# ============================
 
 rows_olives = []
 rows_pixels = []
+procesados = 0
+omitidos = 0
 
 tiff_files = sorted(
     glob(os.path.join(IMAGES_DIR, "*.tif")) +
@@ -189,17 +385,18 @@ tiff_files = sorted(
 )
 
 for img_path in tiff_files:
-
     name = os.path.splitext(os.path.basename(img_path))[0]
     print("Procesando:", name)
 
     mask_flesh_path = os.path.join(MASKS_FLESH_DIR, name + ".png")
-    mask_pit_path   = os.path.join(MASKS_PIT_DIR, name + ".png")
+    mask_pit_path = os.path.join(MASKS_PIT_DIR, name + ".png")
 
     if not os.path.exists(mask_flesh_path) or not os.path.exists(mask_pit_path):
-        print("   ⚠ Faltan máscaras, se omite.")
+        print("    ⚠ Faltan máscaras, se omite.")
+        omitidos += 1
         continue
-
+    
+    procesados += 1
     img = load_tiff32(img_path)
 
     if img.ndim == 3 and img.shape[2] == 3:
@@ -210,11 +407,11 @@ for img_path in tiff_files:
     H, W = img_gray.shape[:2]
 
     mask_flesh = load_and_resize_mask(mask_flesh_path, (H, W))
-    mask_pit   = load_and_resize_mask(mask_pit_path, (H, W))
+    mask_pit = load_and_resize_mask(mask_pit_path, (H, W))
 
     flesh_area = np.sum(mask_flesh)
-    pit_area   = np.sum(mask_pit)
-    ratio      = flesh_area / pit_area if pit_area > 0 else np.nan
+    pit_area = np.sum(mask_pit)
+    ratio = flesh_area / pit_area if pit_area > 0 else np.nan
     flesh_intensity = np.mean(img_gray[mask_flesh]) if flesh_area > 0 else np.nan
 
     arbol = extract_tree_name(name)
@@ -234,7 +431,7 @@ for img_path in tiff_files:
     if "corte_" in name:
         try:
             corte = int(name.split("corte_")[1].split("_")[0])
-        except:
+        except Exception:
             corte = None
 
     for i, val in enumerate(intensidades):
@@ -247,17 +444,21 @@ for img_path in tiff_files:
         })
 
 
-# ============================================================
-# 2) GUARDAR RESULTADOS POR OLIVA
-# ============================================================
+# ============================
+# 2) SAVE BASIC METRICS & TREE AGGREGATION
+# ============================
 
 df_olives = pd.DataFrame(rows_olives)
+
+print("\n--- RECUENTO DE DATOS (TIFF 32-bits) ---")
+print(f"Cortes procesados: {procesados}")
+print(f"Cortes omitidos (sin máscara): {omitidos}")
+print(f"Cortes únicos: {df_olives['name'].nunique()}")
+print(f"Unidades experimentales (árbol × etapa × campaña): {df_olives['arbol'].nunique()}")
+print(f"Árboles físicos únicos (arbol_id): {add_groups(df_olives.copy())['arbol_id'].nunique()}")
+print("----------------------------------------\n")
+
 df_olives.to_csv(OUTPUT_OLIVES, index=False)
-
-
-# ============================================================
-# 3) PROMEDIOS POR ÁRBOL
-# ============================================================
 
 df_trees = df_olives.groupby("arbol").agg({
     "flesh_area": "mean",
@@ -265,21 +466,10 @@ df_trees = df_olives.groupby("arbol").agg({
     "ratio_flesh_pit": "mean",
     "flesh_intensity": "mean"
 }).reset_index()
-
 df_trees.to_csv(OUTPUT_TREES, index=False)
-
-
-# ============================================================
-# 4) GUARDAR INTENSIDADES POR PIXEL
-# ============================================================
 
 df_pixels = pd.DataFrame(rows_pixels)
 df_pixels.to_csv(OUTPUT_PIXELS, index=False)
-
-
-# ============================================================
-# 5) GENERAR FEATURES POR ÁRBOL (INTENSIDADES)
-# ============================================================
 
 df_feat = df_pixels.groupby("arbol")["intensidad"].agg([
     "mean", "std", "median",
@@ -294,13 +484,12 @@ df_feat.columns = [
     "arbol", "mean", "std", "median",
     "p05", "p25", "p75", "p95", "n_pixeles"
 ]
-
 df_feat.to_csv(OUTPUT_FEATURES, index=False)
 
 
-# ============================================================
-# 6) RANDOM FOREST (2 MODELOS) + CV AGRUPADA + LOHO + EXCEL
-# ============================================================
+# ============================
+# 3) MACHINE LEARNING MODELLING (FLESH INTENSITIES ONLY)
+# ============================
 
 if os.path.exists(GRASA_FILE):
 
@@ -310,7 +499,6 @@ if os.path.exists(GRASA_FILE):
         df_grasa = pd.read_csv(GRASA_FILE)
 
     df_grasa.columns = df_grasa.columns.str.strip().str.lower()
-
     col_arbol = [c for c in df_grasa.columns if "arbol" in c][0]
     col_grasa = [c for c in df_grasa.columns if "grasa" in c][0]
 
@@ -319,164 +507,79 @@ if os.path.exists(GRASA_FILE):
         col_grasa: "grasa"
     })[["arbol", "grasa"]]
 
-    # ------------------------------------------------------------
-    # Datasets (grupos: arbol_id = árbol físico; cosecha = año)
-    # ------------------------------------------------------------
+    # Merge intensity features with reference oil content
+    print(f"Unidades experimentales antes del merge: {len(df_feat)}")
     df_ml_int = add_groups(df_feat.merge(df_grasa, on="arbol"))
-    df_ratio  = add_groups(df_trees[["arbol", "ratio_flesh_pit"]].merge(df_grasa, on="arbol"))
-
-    print("\nComprobación de grupos (primeras filas):")
-    print(df_ml_int[["arbol", "arbol_id", "cosecha"]].head(10))
-    print("Árboles físicos:", df_ml_int["arbol_id"].nunique(),
-          "| Cosechas:", sorted(df_ml_int["cosecha"].unique()),
-          "| n muestras:", len(df_ml_int))
+    print(f"Unidades experimentales tras el merge: {len(df_ml_int)}\n")
 
     n_trees = df_ml_int["arbol_id"].nunique()
     gkf = GroupKFold(n_splits=min(5, n_trees))
-    loho = LeaveOneGroupOut()
 
     # ------------------------------------------------------------
-    # MODELO 1: INTENSIDADES
+    # MODEL: FLESH SIGNAL INTENSITIES (RF & PLS)
     # ------------------------------------------------------------
-    print("\n=== MODELO 1: INTENSIDADES ===")
+    print("\n=== MODELO: INTENSIDADES ===")
+
     cv_tree_int, folds_tree_int, oof_tree_int = run_cv(
-        df_ml_int, FEATS, gkf, df_ml_int["arbol_id"], label="Int | GroupKFold árbol")
-    cv_loho_int, folds_loho_int, oof_loho_int = run_cv(
-        df_ml_int, FEATS, loho, df_ml_int["cosecha"], label="Int | LOHO")
+        df_ml_int, FEATS, gkf, df_ml_int["arbol_id"], label="Int RF | GroupKFold árbol"
+    )
 
-    # PLS-R lineal (mismas particiones que RF)
     cv_tree_int_pls, folds_tree_int_pls, oof_tree_int_pls = run_cv(
         df_ml_int, FEATS, gkf, df_ml_int["arbol_id"],
-        label="Int PLS | GroupKFold árbol", fit_predict=pls_fit_predict)
-    cv_loho_int_pls, folds_loho_int_pls, oof_loho_int_pls = run_cv(
-        df_ml_int, FEATS, loho, df_ml_int["cosecha"],
-        label="Int PLS | LOHO", fit_predict=pls_fit_predict)
+        label="Int PLS | GroupKFold árbol", fit_predict=pls_fit_predict
+    )
 
-    # Modelo final (solo para importancias y uso posterior; sus métricas
-    # in-sample NO se reportan)
-    model_int = RandomForestRegressor(n_estimators=N_ESTIMATORS,
-                                      max_depth=None,
-                                      random_state=RANDOM_STATE)
-    model_int.fit(df_ml_int[FEATS], df_ml_int["grasa"])
+    # Feature correlation matrix & permutation importance
+    df_corr_int = df_ml_int[FEATS].corr()
+
+    df_importancia_int = compute_rf_cv_permutation_importance(
+        df_ml_int[FEATS], df_ml_int["grasa"], df_ml_int["arbol_id"], df_ml_int["arbol_id"], gkf
+    )
+
+    df_importancia_int_pls = compute_pls_cv_permutation_importance(
+        df_ml_int[FEATS], df_ml_int["grasa"], df_ml_int["arbol_id"], df_ml_int["arbol_id"], gkf
+    )
 
     df_resultados_int = df_ml_int.copy()
-    df_resultados_int["pred_oof_arbol"] = oof_tree_int
-    df_resultados_int["pred_oof_loho"] = oof_loho_int
-    df_resultados_int["error_oof_arbol"] = df_resultados_int["pred_oof_arbol"] - df_resultados_int["grasa"]
-    df_resultados_int["error_oof_loho"] = df_resultados_int["pred_oof_loho"] - df_resultados_int["grasa"]
+    df_resultados_int["pred_oof_arbol_rf"] = oof_tree_int
     df_resultados_int["pred_oof_arbol_pls"] = oof_tree_int_pls
-    df_resultados_int["pred_oof_loho_pls"] = oof_loho_int_pls
-    df_resultados_int["error_oof_arbol_pls"] = df_resultados_int["pred_oof_arbol_pls"] - df_resultados_int["grasa"]
-    df_resultados_int["error_oof_loho_pls"] = df_resultados_int["pred_oof_loho_pls"] - df_resultados_int["grasa"]
-
-    df_importancia_int = pd.DataFrame({
-        "feature": FEATS,
-        "importance": model_int.feature_importances_
-    }).sort_values("importance", ascending=False)
 
     # ------------------------------------------------------------
-    # MODELO 2: SOLO RATIO FLESH/PIT
+    # EXPORT RESULTS TO EXCEL
     # ------------------------------------------------------------
-    print("\n=== MODELO 2: RATIO FLESH/PIT ===")
-    FEATS_RATIO = ["ratio_flesh_pit"]
+    with pd.ExcelWriter(EXCEL_OUTPUT, engine="openpyxl") as writer:
 
-    cv_tree_ratio, folds_tree_ratio, oof_tree_ratio = run_cv(
-        df_ratio, FEATS_RATIO, gkf, df_ratio["arbol_id"], label="Ratio | GroupKFold árbol")
-    cv_loho_ratio, folds_loho_ratio, oof_loho_ratio = run_cv(
-        df_ratio, FEATS_RATIO, loho, df_ratio["cosecha"], label="Ratio | LOHO")
-
-    # PLS-R con una sola variable = regresión lineal simple (1 componente)
-    cv_tree_ratio_pls, folds_tree_ratio_pls, oof_tree_ratio_pls = run_cv(
-        df_ratio, FEATS_RATIO, gkf, df_ratio["arbol_id"],
-        label="Ratio PLS | GroupKFold árbol", fit_predict=pls_fit_predict)
-    cv_loho_ratio_pls, folds_loho_ratio_pls, oof_loho_ratio_pls = run_cv(
-        df_ratio, FEATS_RATIO, loho, df_ratio["cosecha"],
-        label="Ratio PLS | LOHO", fit_predict=pls_fit_predict)
-
-    model_ratio = RandomForestRegressor(n_estimators=N_ESTIMATORS,
-                                        max_depth=None,
-                                        random_state=RANDOM_STATE)
-    model_ratio.fit(df_ratio[FEATS_RATIO], df_ratio["grasa"])
-
-    df_resultados_ratio = df_ratio.copy()
-    df_resultados_ratio["pred_oof_arbol"] = oof_tree_ratio
-    df_resultados_ratio["pred_oof_loho"] = oof_loho_ratio
-    df_resultados_ratio["error_oof_arbol"] = df_resultados_ratio["pred_oof_arbol"] - df_resultados_ratio["grasa"]
-    df_resultados_ratio["error_oof_loho"] = df_resultados_ratio["pred_oof_loho"] - df_resultados_ratio["grasa"]
-    df_resultados_ratio["pred_oof_arbol_pls"] = oof_tree_ratio_pls
-    df_resultados_ratio["pred_oof_loho_pls"] = oof_loho_ratio_pls
-    df_resultados_ratio["error_oof_arbol_pls"] = df_resultados_ratio["pred_oof_arbol_pls"] - df_resultados_ratio["grasa"]
-    df_resultados_ratio["error_oof_loho_pls"] = df_resultados_ratio["pred_oof_loho_pls"] - df_resultados_ratio["grasa"]
-
-    df_importancia_ratio = pd.DataFrame({
-        "feature": FEATS_RATIO,
-        "importance": model_ratio.feature_importances_
-    })
-
-    # ------------------------------------------------------------
-    # EXPORTAR TODO EN UN SOLO EXCEL
-    # ------------------------------------------------------------
-    excel_output = "resultados_modelo_randomforest_tiff_dos_modelos.xlsx"
-
-    with pd.ExcelWriter(excel_output, engine="openpyxl") as writer:
-
-        # Modelo intensidades
+        # RF Intensities
         df_resultados_int.to_excel(writer, sheet_name="predicciones_intensidad", index=False)
-        df_importancia_int.to_excel(writer, sheet_name="importancia_intensidad", index=False)
-        resumen("RandomForest (intensidades)", cv_tree_int, cv_loho_int, len(FEATS)) \
-            .to_excel(writer, sheet_name="modelo_intensidad", index=False)
-        folds_tree_int.to_excel(writer, sheet_name="folds_arbol_int", index=False)
-        folds_loho_int.to_excel(writer, sheet_name="folds_loho_int", index=False)
+        df_importancia_int.to_excel(writer, sheet_name="importancia_rf_intensidad", index=False)
+        df_corr_int.to_excel(writer, sheet_name="correlacion_predictores", index=True)
 
-        # Modelo ratio
-        df_resultados_ratio.to_excel(writer, sheet_name="predicciones_ratio", index=False)
-        df_importancia_ratio.to_excel(writer, sheet_name="importancia_ratio", index=False)
-        resumen("RandomForest (ratio flesh/pit)", cv_tree_ratio, cv_loho_ratio, len(FEATS_RATIO)) \
-            .to_excel(writer, sheet_name="modelo_ratio", index=False)
-        folds_tree_ratio.to_excel(writer, sheet_name="folds_arbol_ratio", index=False)
-        folds_loho_ratio.to_excel(writer, sheet_name="folds_loho_ratio", index=False)
+        resumen("RF intensidades", cv_tree_int, len(FEATS)) \
+            .to_excel(writer, sheet_name="modelo_rf_intensidad", index=False)
+        folds_tree_int.to_excel(writer, sheet_name="folds_arbol_rf_int", index=False)
 
-        # PLS-R lineal
-        resumen_pls("PLS-R (intensidades)", cv_tree_int_pls, cv_loho_int_pls, len(FEATS)) \
+        # PLS Intensities
+        df_importancia_int_pls.to_excel(writer, sheet_name="importancia_pls_intensidad", index=False)
+        resumen("PLS intensidades", cv_tree_int_pls, len(FEATS)) \
             .to_excel(writer, sheet_name="modelo_pls_intensidad", index=False)
         folds_tree_int_pls.to_excel(writer, sheet_name="folds_arbol_pls_int", index=False)
-        folds_loho_int_pls.to_excel(writer, sheet_name="folds_loho_pls_int", index=False)
-        resumen_pls("PLS-R (ratio flesh/pit)", cv_tree_ratio_pls, cv_loho_ratio_pls, len(FEATS_RATIO)) \
-            .to_excel(writer, sheet_name="modelo_pls_ratio", index=False)
-        folds_tree_ratio_pls.to_excel(writer, sheet_name="folds_arbol_pls_ratio", index=False)
-        folds_loho_ratio_pls.to_excel(writer, sheet_name="folds_loho_pls_ratio", index=False)
 
-        # Comparación RF vs PLS-R
-        comp_rows = []
-        for modelo, algoritmo, val, met in [
-            ("Intensidades", "RandomForest", "GroupKFold árbol", cv_tree_int),
-            ("Intensidades", "RandomForest", "LOHO", cv_loho_int),
-            ("Intensidades", "PLS-R", "GroupKFold árbol", cv_tree_int_pls),
-            ("Intensidades", "PLS-R", "LOHO", cv_loho_int_pls),
-            ("Ratio", "RandomForest", "GroupKFold árbol", cv_tree_ratio),
-            ("Ratio", "RandomForest", "LOHO", cv_loho_ratio),
-            ("Ratio", "PLS-R", "GroupKFold árbol", cv_tree_ratio_pls),
-            ("Ratio", "PLS-R", "LOHO", cv_loho_ratio_pls),
-        ]:
-            comp_rows.append({"Variables": modelo, "Algoritmo": algoritmo,
-                              "Validacion": val, **met})
-        df_comp = pd.DataFrame(comp_rows)
-        df_comp.to_excel(writer, sheet_name="comparacion_RF_vs_PLS", index=False)
+        # Algorithm comparison summary table
+        comp_rows = [
+            {"Algoritmo": "RF", "Validacion": "GroupKFold árbol", **cv_tree_int},
+            {"Algoritmo": "PLS", "Validacion": "GroupKFold árbol", **cv_tree_int_pls},
+        ]
+
+        pd.DataFrame(comp_rows).to_excel(writer, sheet_name="comparacion_RF_vs_PLS", index=False)
 
     print("\n==============================")
-    print("   RESULTADOS RANDOM FOREST (TIFF)")
+    print("   RESULTADOS RANDOM FOREST Y PLS (TIFF 32-bits)")
     print("==============================")
-    print("Intensidades | GroupKFold árbol -> R2: %.3f MAE: %.3f RMSE: %.3f" %
+    print("Intensidades RF  | GroupKFold árbol -> R2: %.3f MAE: %.3f RMSE: %.3f" %
           (cv_tree_int["R2"], cv_tree_int["MAE"], cv_tree_int["RMSE"]))
-    print("Intensidades | LOHO            -> R2: %.3f MAE: %.3f RMSE: %.3f" %
-          (cv_loho_int["R2"], cv_loho_int["MAE"], cv_loho_int["RMSE"]))
-    print("Ratio        | GroupKFold árbol -> R2: %.3f MAE: %.3f RMSE: %.3f" %
-          (cv_tree_ratio["R2"], cv_tree_ratio["MAE"], cv_tree_ratio["RMSE"]))
-    print("Ratio        | LOHO            -> R2: %.3f MAE: %.3f RMSE: %.3f" %
-          (cv_loho_ratio["R2"], cv_loho_ratio["MAE"], cv_loho_ratio["RMSE"]))
-    print("\nComparación RF vs PLS-R (out-of-fold agrupado):")
-    print(df_comp.round(3).to_string(index=False))
-    print("✔ Archivo Excel generado:", excel_output)
+    print("Intensidades PLS | GroupKFold árbol -> R2: %.3f MAE: %.3f RMSE: %.3f" %
+          (cv_tree_int_pls["R2"], cv_tree_int_pls["MAE"], cv_tree_int_pls["RMSE"]))
+    print("\n✔ Archivo Excel generado:", EXCEL_OUTPUT)
 
 else:
     print("\n⚠ No se encontró el archivo de grasa:", GRASA_FILE)
